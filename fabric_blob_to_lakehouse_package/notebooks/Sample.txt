@@ -1,0 +1,82 @@
+from notebookutils import mssparkutils
+from pyspark.sql.functions import input_file_name, current_timestamp
+import uuid
+
+# -------------------------------------------------------------------
+# 1. Ensure config & log tables exist + seed your two accounts
+# -------------------------------------------------------------------
+spark.sql("""
+CREATE TABLE IF NOT EXISTS storage_config (
+    account_name STRING,
+    container_name STRING,
+    account_url STRING,
+    auth_method STRING,
+    file_format STRING,
+    target_path STRING
+)
+""")
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS file_ingestion_log (
+    id STRING,
+    account_name STRING,
+    container_name STRING,
+    source_path STRING,
+    target_path STRING,
+    file_size BIGINT,
+    ingestion_timestamp TIMESTAMP
+)
+""")
+
+# Seed your two accounts if not already present
+spark.sql("""
+MERGE INTO storage_config t
+USING (
+  SELECT 'VendorMak' AS account_name, 'Wavedata' AS container_name,
+         'https://vendormak.blob.core.windows.net' AS account_url,
+         'managed_identity' AS auth_method,
+         'binary' AS file_format,
+         'lakehouse://Files/VendorMak/Wavedata' AS target_path
+  UNION ALL
+  SELECT 'VendorEli', 'Wavedata',
+         'https://vendoreli.blob.core.windows.net',
+         'managed_identity', 'binary',
+         'lakehouse://Files/VendorEli/Wavedata'
+) s
+ON t.account_name = s.account_name AND t.container_name = s.container_name
+WHEN NOT MATCHED THEN
+  INSERT *
+""")
+
+# -------------------------------------------------------------------
+# 2. Load configs
+# -------------------------------------------------------------------
+configs = spark.sql("SELECT * FROM storage_config").collect()
+
+# -------------------------------------------------------------------
+# 3. Loop each source, copy files, log metadata
+# -------------------------------------------------------------------
+for cfg in configs:
+    source_path = f"abfss://{cfg.container_name}@{cfg.account_url.replace('https://','')}"
+    dest_path = cfg.target_path.replace("lakehouse://", "Files/")
+
+    print(f"Copying from {source_path} → {dest_path}")
+
+    # Copy recursively
+    mssparkutils.fs.cp(source_path, dest_path, recurse=True)
+
+    # Log metadata: list files from source
+    df = (spark.read.format("binaryFile")
+          .option("recursiveFileLookup","true")
+          .load(source_path)
+          .withColumn("account_name", spark.createDataFrame([(cfg.account_name,)], ["account_name"]).account_name)
+          .withColumn("container_name", spark.createDataFrame([(cfg.container_name,)], ["container_name"]).container_name)
+          .withColumn("target_path", spark.createDataFrame([(dest_path,)], ["target_path"]).target_path)
+          .withColumn("id", spark.sql("SELECT uuid()").collect()[0][0])
+          .withColumn("ingestion_timestamp", current_timestamp())
+         )
+
+    df.select("id","account_name","container_name","path","target_path","length","ingestion_timestamp") \
+      .withColumnRenamed("path","source_path") \
+      .withColumnRenamed("length","file_size") \
+      .write.mode("append").saveAsTable("file_ingestion_log")
