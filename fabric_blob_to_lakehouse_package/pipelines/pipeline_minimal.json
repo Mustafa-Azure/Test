@@ -1,0 +1,21 @@
+{
+  "name": "BlobToLakehouse_Orchestrator",
+  "properties": {
+    "activities": [
+      {
+        "name": "Run_Orchestrator",
+        "type": "SynapseNotebook",
+        "typeProperties": {
+          "notebook": {
+            "referenceName": "Orchestrate_Blob_To_Lakehouse",
+            "type": "NotebookReference"
+          },
+          "parameters": {}
+        }
+      }
+    ],
+    "annotations": [
+      "generated-by-chatgpt"
+    ]
+  }
+}
