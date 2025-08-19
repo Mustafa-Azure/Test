@@ -1,0 +1,207 @@
+# Import necessary libraries
+from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, col, max as spark_max
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
+import json
+import os
+import datetime
+
+# --- Configuration (Update with your specific values) ---
+key_vault_name = "your_key_vault_name"
+secret_name_client_id = "your_service_principal_client_id_secret_name"
+secret_name_client_secret = "your_service_principal_client_secret_secret_name"
+tenant_id = "your_tenant_id"
+
+# Example storage accounts configuration (you'd typically load this from a config file)
+storage_accounts_config = [
+    {
+        "accountName": "StorageAccount1",
+        "containerName": "container1",
+        "rootFolderPath": "media-files/account1/", # Starting point for recursive listing
+        "authenticationType": "ServicePrincipal"
+    },
+    {
+        "accountName": "StorageAccount2",
+        "containerName": "container2",
+        "rootFolderPath": "media-files/account2/",
+        "authenticationType": "ServicePrincipal"
+    }
+]
+
+# Lakehouse destination base path
+lakehouse_destination_base_path = "/lakehouse/default/Files/raw_media_files/"
+
+# Watermark table name in Lakehouse (for tracking last processed timestamps)
+watermark_table_name = "incremental_watermark"
+
+# --- Retrieve Service Principal credentials from Key Vault securely ---
+kv_client = SecretClient(vault_url=f"https://{key_vault_name}.vault.azure.net/", credential=DefaultAzureCredential())
+
+try:
+    client_id = kv_client.get_secret(secret_name_client_id).value
+    client_secret = kv_client.get_secret(secret_name_client_secret).value
+except Exception as e:
+    print(f"Error retrieving secrets from Key Vault: {e}")
+    raise # Re-raise the exception to stop execution if credentials can't be fetched
+
+# --- Function to recursively list files (same as before) ---
+def list_files_recursively(path):
+    all_files = []
+    try:
+        items = mssparkutils.fs.ls(path)
+        for item in items:
+            if item.isDir:
+                all_files.extend(list_files_recursively(item.path))
+            else:
+                all_files.append(item)
+    except Exception as e:
+        print(f"Error listing files in {path}: {e}")
+    return all_files
+
+# --- Function to get the last watermark for a given storage account ---
+def get_last_watermark(account_name):
+    try:
+        # Read the watermark table if it exists
+        watermark_df = spark.read.format("delta").table(watermark_table_name)
+        
+        # Filter for the specific storage account and get the max watermark
+        last_watermark = watermark_df.filter(col("storageAccount") == account_name)\
+                                      .select(spark_max("watermarkValue").alias("max_watermark"))\
+                                      .collect()[0]["max_watermark"]
+        return last_watermark if last_watermark else datetime.datetime.min # Return min datetime if no watermark found
+    except Exception as e:
+        print(f"Watermark table '{watermark_table_name}' not found or error reading: {e}. Assuming initial load.")
+        return datetime.datetime.min # Assume initial load if table doesn't exist or error
+
+# --- Function to update the watermark for a given storage account ---
+def update_watermark(account_name, new_watermark):
+    try:
+        # Create a DataFrame with the new watermark value
+        new_watermark_df = spark.createDataFrame(
+            [(account_name, new_watermark)],
+            ["storageAccount", "watermarkValue"]
+        )
+
+        # Merge the new watermark into the watermark table
+        # This will update the existing watermark for the account or insert if new
+        spark.sql(f"""
+            MERGE INTO delta.`{spark.conf.get("spark.hadoop.fs.azure.account.oauth2.client.id.<your_workspace_name>.dfs.core.windows.net", "")}@onelake.dfs.fabric.microsoft.com/{lakehouse_destination_base_path.replace('/lakehouse/default/Files/', '')}{watermark_table_name}` AS target
+            USING new_watermark_df AS source
+            ON target.storageAccount = source.storageAccount
+            WHEN MATCHED THEN UPDATE SET target.watermarkValue = source.watermarkValue
+            WHEN NOT MATCHED THEN INSERT (storageAccount, watermarkValue) VALUES (source.storageAccount, source.watermarkValue)
+        """)
+        print(f"Watermark for {account_name} updated to {new_watermark}")
+    except Exception as e:
+        print(f"Error updating watermark for {account_name}: {e}")
+
+# --- Main process for reading file metadata incrementally ---
+file_metadata_list = []
+new_watermarks = {} # To store the new highest watermark for each account
+
+for account_details in storage_accounts_config:
+    account_name = account_details['accountName']
+    container_name = account_details['containerName']
+    root_folder_path = account_details['rootFolderPath']
+
+    # Get the last processed watermark for this storage account
+    last_watermark = get_last_watermark(account_name)
+    print(f"Processing {account_name}. Last watermark: {last_watermark}")
+
+    # Configure Spark for Service Principal access
+    spark.conf.set(f"fs.azure.account.auth.type.{account_name}.dfs.core.windows.net", "OAuth")
+    spark.conf.set(f"fs.azure.account.oauth.provider.type.{account_name}.dfs.core.windows.net", "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")
+    spark.conf.set(f"fs.azure.account.oauth2.client.id.{account_name}.dfs.core.windows.net", client_id)
+    spark.conf.set(f"fs.azure.account.oauth2.client.secret.{account_name}.dfs.core.windows.net", client_secret)
+    spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{account_name}.dfs.core.windows.net", f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")
+
+    base_abfss_path = f"abfss://{container_name}@{account_name}.dfs.core.windows.net/{root_folder_path}"
+    print(f"Listing files in: {base_abfss_path}")
+    
+    files_to_copy = []
+    current_max_modified_time = last_watermark
+
+    # List files and filter by last modified time
+    all_files_in_source = list_files_recursively(base_abfss_path)
+    
+    for file_info in all_files_in_source:
+        # The modificationTime is usually in milliseconds, convert to datetime
+        file_last_modified_dt = datetime.datetime.fromtimestamp(file_info.modificationTime / 1000)
+
+        if file_last_modified_dt > last_watermark:
+            files_to_copy.append(file_info)
+            if file_last_modified_dt > current_max_modified_time:
+                current_max_modified_time = file_last_modified_dt
+        else:
+            print(f"Skipping {file_info.name} as it was not modified since last run.")
+
+    if files_to_copy:
+        for file_info in files_to_copy:
+            relative_path = file_info.path.replace(f"abfss://{container_name}@{account_name}.dfs.core.windows.net/", "")
+            file_metadata_list.append({
+                "storageAccount": account_name,
+                "containerName": container_name,
+                "filePath": file_info.path,
+                "relativePathInContainer": relative_path,
+                "fileName": file_info.name,
+                "fileSize": file_info.size,
+                "lastModified": datetime.datetime.fromtimestamp(file_info.modificationTime / 1000)
+            })
+        new_watermarks[account_name] = current_max_modified_time
+    else:
+        print(f"No new or updated files found for {account_name}.")
+
+
+# Create and display Spark DataFrame for incremental metadata
+schema = StructType([
+    StructField("storageAccount", StringType(), True),
+    StructField("containerName", StringType(), True),
+    StructField("filePath", StringType(), True),
+    StructField("relativePathInContainer", StringType(), True),
+    StructField("fileName", StringType(), True),
+    StructField("fileSize", LongType(), True),
+    StructField("lastModified", TimestampType(), True)
+])
+
+if file_metadata_list:
+    incremental_metadata_df = spark.createDataFrame(file_metadata_list, schema=schema)
+    print("Incremental metadata to process:")
+    incremental_metadata_df.show(truncate=False)
+
+    # --- Iterating over the incremental metadata and copying files ---
+    # Define the Lakehouse destination base path
+    # lakehouse_destination_base_path is already defined
+
+    for row in incremental_metadata_df.collect():
+        source_abfss_path = row.filePath
+        
+        # Construct the destination path, preserving the nested folder structure
+        destination_path_in_lakehouse = os.path.join(
+            lakehouse_destination_base_path, 
+            row.storageAccount, 
+            row.relativePathInContainer
+        )
+        
+        # Ensure the destination directory exists before copying
+        destination_directory = os.path.dirname(destination_path_in_lakehouse)
+        try:
+            mssparkutils.fs.mkdirs(destination_directory, True)
+        except Exception as e:
+            print(f"Error creating directory {destination_directory}: {e}")
+            continue
+
+        try:
+            # Copy the file
+            mssparkutils.fs.cp(source_abfss_path, destination_path_in_lakehouse, True)
+            print(f"Copied {source_abfss_path} to {destination_path_in_lakehouse}")
+        except Exception as e:
+            print(f"Error copying {source_abfss_path}: {e}")
+
+    # --- Update watermarks after successful copying ---
+    for account, watermark in new_watermarks.items():
+        update_watermark(account, watermark)
+
+else:
+    print("No new or updated files found across all configured storage accounts.")
