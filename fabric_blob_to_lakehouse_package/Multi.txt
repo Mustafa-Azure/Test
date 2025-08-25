@@ -1,0 +1,34 @@
+from pyspark.sql import functions as F
+
+# Load tables
+orchestration_df = spark.read.table("Lakehouse.orchestration")
+config_df = spark.read.table("Lakehouse.configuration")
+
+# Pivot config table
+pivoted_config = (
+    config_df
+    .groupBy("process_id")
+    .pivot("config_name")
+    .agg(F.first("config_value"))
+)
+
+# Join with orchestration
+final_df = orchestration_df.join(pivoted_config, on="process_id", how="inner")
+
+# Convert to dictionary
+final_dict = (
+    final_df.rdd
+    .map(lambda row: (
+        row["process_id"],
+        {
+            "process_name": row["process_name"],
+            "account_name": row["account_name"],
+            "container_name": row["container_name"]
+        }
+    ))
+    .collectAsMap()
+)
+
+# Example usage
+for pid, details in final_dict.items():
+    print(pid, details)
