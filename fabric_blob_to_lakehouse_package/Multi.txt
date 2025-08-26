@@ -1,5 +1,18 @@
 from pyspark.sql import functions as F
 
+def compute_sha256(path: str) -> str:
+    """Compute SHA256 checksum of a file"""
+    with mssparkutils.fs.open(path, "rb") as f:
+        sha = hashlib.sha256()
+        while chunk := f.read(8192):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+df = spark.createDataFrame(validation_records)
+
+# Append to existing table
+df.write.mode("append").saveAsTable("FileCopyValidation")
+
 # Load tables
 orchestration_df = spark.read.table("Lakehouse.orchestration")
 config_df = spark.read.table("Lakehouse.configuration")
